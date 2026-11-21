@@ -3,6 +3,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <BleGamepad.h>
+#include <Preferences.h>
 #include <esp_sleep.h>
 #include <math.h>
 
@@ -12,6 +13,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // Bluetooth Gamepad (Seen as Xbox/DirectInput Gamepad in Forza)
 BleGamepad bleGamepad("Cosmic Wheel", "Custom", 100);
+
+Preferences prefs;
 
 // --- Steering Profiles (Max Steering Lock Angle) ---
 struct SteerProfile {
@@ -36,13 +39,17 @@ unsigned long buttonDownTime = 0;
 bool isDown = false;
 int clickCount = 0;
 
+// Steering Direction & Calibration
+bool invertSteering = false;
+bool showBanner = false;
+const char* bannerText = "";
+unsigned long bannerTimer = 0;
+
 // --- IMU & Complementary Filter ---
 #define MPU_ADDR 0x68
-float rollAngle = 0.0;
+float steerAngleRaw = 0.0;
 float zeroOffset = 0.0;
 unsigned long lastMicros = 0;
-bool showZeroBanner = false;
-unsigned long zeroBannerTimer = 0;
 
 // Session & Battery
 unsigned long sessionStart = 0;
@@ -82,15 +89,19 @@ void setup() {
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
+  // Load saved preferences
+  prefs.begin("cosmic_wheel", false);
+  invertSteering = prefs.getBool("invert", false);
+
   // Initialize OLED
   if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(16, 18);
-    display.println("COSMIC WHEEL v1.0");
+    display.println("COSMIC WHEEL v1.1");
     display.setCursor(18, 34);
-    display.println("ANALOG STEERING");
+    display.println("SIDE-TILT STEER");
     display.setCursor(22, 50);
     display.println("STARTING BLE...");
     display.display();
@@ -116,7 +127,7 @@ void setup() {
 
   // Start Bluetooth Gamepad
   BleGamepadConfiguration config;
-  config.setAutoReport(false); // Manual report for high-speed deterministic sync
+  config.setAutoReport(false);
   bleGamepad.begin(&config);
 
   sessionStart = millis();
@@ -126,16 +137,15 @@ void setup() {
 
 unsigned long lastScreen = 0;
 int16_t currentSteerAxis = 0;
-float currentFilteredAngle = 0.0;
 
 void loop() {
   unsigned long now = millis();
   unsigned long nowMicros = micros();
   float dt = (nowMicros - lastMicros) / 1000000.0f;
   lastMicros = nowMicros;
-  if (dt <= 0.0f || dt > 0.05f) dt = 0.01f; // Clamp delta time
+  if (dt <= 0.0f || dt > 0.05f) dt = 0.01f;
 
-  // 1. BOOT Button Logic
+  // 1. BOOT Button Logic (Single, Double, Triple Click)
   bool btn = (digitalRead(BOOT_BUTTON_PIN) == LOW);
   if (btn && !isDown) {
     isDown = true;
@@ -153,17 +163,26 @@ void loop() {
 
   if (clickCount > 0 && (now - lastButtonPress > 280)) {
     if (clickCount == 1) {
+      // 1 Click: Cycle Steering Profiles
       currentProfile = (currentProfile + 1) % NUM_PROFILES;
-    } else if (clickCount >= 2) {
-      // Double-Click: Calibrate resting zero position
-      zeroOffset = currentFilteredAngle;
-      showZeroBanner = true;
-      zeroBannerTimer = now;
+    } else if (clickCount == 2) {
+      // 2 Clicks: Set resting zero position
+      zeroOffset = steerAngleRaw;
+      bannerText = ">>> ZERO LOCKED! <<<";
+      showBanner = true;
+      bannerTimer = now;
+    } else if (clickCount >= 3) {
+      // 3 Clicks: Invert Direction (Flip Left <-> Right if ever needed)
+      invertSteering = !invertSteering;
+      prefs.putBool("invert", invertSteering);
+      bannerText = invertSteering ? "DIR: REVERSED" : "DIR: NORMAL";
+      showBanner = true;
+      bannerTimer = now;
     }
     clickCount = 0;
   }
 
-  // 2. Read 14 Bytes of 6-Axis Motion Data
+  // 2. Read 14 Bytes of Motion Data
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B); // ACCEL_XOUT_H
   Wire.endTransmission(false);
@@ -181,26 +200,32 @@ void loop() {
     int16_t rawAx = (int16_t)((axh << 8) | axl);
     int16_t rawAy = (int16_t)((ayh << 8) | ayl);
     int16_t rawAz = (int16_t)((azh << 8) | azl);
-    int16_t rawGy = (int16_t)((gyh << 8) | gyl);
+    int16_t rawGx = (int16_t)((gxh << 8) | gxl);
+    int16_t rawGz = (int16_t)((gzh << 8) | gzl);
 
     float ax = (float)rawAx / 8192.0f; // ±4g scale
     float ay = (float)rawAy / 8192.0f;
     float az = (float)rawAz / 8192.0f;
-    float gyroRollRate = (float)rawGy / 65.5f; // deg/s at ±500 dps
+    
+    // Side-to-Side Steering:
+    // With vertical breadboard mount on back, side-to-side tilt moves gravity into AX,
+    // and angular rotation rate is measured by rawGx (in-plane roll).
+    float gyroSteerRate = (float)rawGx / 65.5f;
 
-    // Pitch-invariant Roll calculation:
-    // Measures tilt angle whether controller is held flat in lap or tilted up
-    float accelRoll = atan2(ay, sqrt(ax * ax + az * az)) * (180.0f / M_PI);
+    // Pitch-invariant Side-Tilt Angle (Right Side Down = Positive, Left Side Down = Negative)
+    float accelSideTilt = atan2(ax, sqrt(ay * ay + az * az)) * (180.0f / M_PI);
 
-    // Complementary Filter: 96% fast gyro integration + 4% gravity reference
-    rollAngle = 0.96f * (rollAngle + gyroRollRate * dt) + 0.04f * accelRoll;
+    // Complementary Filter: 96% gyro rate integration + 4% gravity tilt
+    steerAngleRaw = 0.96f * (steerAngleRaw + gyroSteerRate * dt) + 0.04f * accelSideTilt;
   }
 
-  // Apply User Resting Zero Offset
-  currentFilteredAngle = rollAngle;
-  float steerAngle = currentFilteredAngle - zeroOffset;
+  // 3. Compute Steering Angle & Inversion
+  float steerAngle = steerAngleRaw - zeroOffset;
+  if (invertSteering) {
+    steerAngle = -steerAngle;
+  }
 
-  // 3. Process Steering Angle with Profile Dynamics
+  // 4. Process Angle through Profile Dynamics
   SteerProfile& prof = profiles[currentProfile];
   float effectiveAngle = 0.0f;
 
@@ -211,29 +236,28 @@ void loop() {
     if (maxMag < 5.0f) maxMag = 5.0f;
 
     float normalized = constrain(magnitude / maxMag, 0.0f, 1.0f);
-    // Apply power curve for gentle micro-steering near center and sharp lock near edges
     float curved = pow(normalized, prof.linearity);
 
     effectiveAngle = sign * curved;
   }
 
   // Map to 16-bit signed Gamepad X-Axis (-32767 to +32767)
-  // Left tilt (effectiveAngle < 0) -> Negative X (Steer Left)
-  // Right tilt (effectiveAngle > 0) -> Positive X (Steer Right)
+  // Right tilt down -> Positive X (Turn Right)
+  // Left tilt down -> Negative X (Turn Left)
   currentSteerAxis = (int16_t)constrain(effectiveAngle * 32767.0f, -32767.0f, 32767.0f);
 
-  // 4. Send Bluetooth Gamepad Left Stick Report
+  // 5. Send Bluetooth Gamepad Left Stick Report
   bool connected = bleGamepad.isConnected();
   if (connected) {
     bleGamepad.setX(currentSteerAxis);
     bleGamepad.sendReport();
   }
 
-  // 5. Battery % Countdown
+  // 6. Battery % Countdown
   unsigned long minutes = (now - sessionStart) / 60000;
   batteryPct = max(8.0f, 96.0f - (minutes * 0.35f));
 
-  // 6. OLED Telemetry HUD (Updated every 50ms / 20fps for silky steering visual)
+  // 7. OLED Telemetry HUD (Updated every 50ms / 20fps)
   if (now - lastScreen > 50) {
     lastScreen = now;
     display.clearDisplay();
@@ -261,11 +285,11 @@ void loop() {
       display.println("PAIRING...");
     }
 
-    // Steering Angle Text
+    // Steering Angle Text or Banner
     display.setCursor(0, 24);
-    if (showZeroBanner) {
-      display.println(">>> ZERO LOCKED! <<<");
-      if (now - zeroBannerTimer > 1200) showZeroBanner = false;
+    if (showBanner) {
+      display.println(bannerText);
+      if (now - bannerTimer > 1200) showBanner = false;
     } else {
       display.print("STEER: ");
       if (fabs(steerAngle) < 1.0f) {
@@ -273,10 +297,11 @@ void loop() {
       } else if (steerAngle < 0) {
         display.print("<- ");
         display.print(fabs(steerAngle), 1);
-        display.println(" deg");
+        display.println((char)247);
       } else {
         display.print(steerAngle, 1);
-        display.println(" deg ->");
+        display.print((char)247);
+        display.println(" ->");
       }
     }
 
@@ -302,7 +327,7 @@ void loop() {
     // Highlight needle tip
     display.drawFastVLine(needleX, gaugeY - 1, 12, SSD1306_WHITE);
 
-    // Bottom Status: 16-bit Axis Value
+    // Bottom Status: 16-bit Axis Value & Lock Angle
     display.setCursor(0, 54);
     display.print("AXIS: ");
     display.print(currentSteerAxis);
@@ -310,7 +335,7 @@ void loop() {
     display.setCursor(80, 54);
     display.print("LOCK:");
     display.print((int)prof.maxAngle);
-    display.print((char)247); // Degree symbol
+    display.print((char)247);
 
     // Deep Sleep Prompt
     if (isDown && (now - buttonDownTime > 800)) {
@@ -323,5 +348,5 @@ void loop() {
     display.display();
   }
 
-  delay(6); // ~140Hz high-polling motion loop
+  delay(6);
 }

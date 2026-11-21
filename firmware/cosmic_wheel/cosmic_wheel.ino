@@ -11,7 +11,7 @@
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// Bluetooth Gamepad (Seen as Xbox/DirectInput Gamepad in Forza)
+// Bluetooth Gamepad (Seen as Xbox/DirectInput Gamepad in Windows)
 BleGamepad bleGamepad("Cosmic Wheel", "Custom", 100);
 
 Preferences prefs;
@@ -45,11 +45,10 @@ bool showBanner = false;
 const char* bannerText = "";
 unsigned long bannerTimer = 0;
 
-// --- IMU & Complementary Filter ---
+// --- IMU ---
 #define MPU_ADDR 0x68
 float steerAngleRaw = 0.0;
 float zeroOffset = 0.0;
-unsigned long lastMicros = 0;
 
 // Session & Battery
 unsigned long sessionStart = 0;
@@ -84,6 +83,10 @@ void enterDeepSleep() {
 }
 
 void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n=== Cosmic Wheel Initializing ===");
+
   Wire.begin(21, 22);
   Wire.setClock(400000); // 400kHz Fast I2C
 
@@ -99,9 +102,9 @@ void setup() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(16, 18);
-    display.println("COSMIC WHEEL v1.1");
+    display.println("COSMIC WHEEL v1.2");
     display.setCursor(18, 34);
-    display.println("SIDE-TILT STEER");
+    display.println("ANALOG STEERING");
     display.setCursor(22, 50);
     display.println("STARTING BLE...");
     display.display();
@@ -111,12 +114,6 @@ void setup() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);
   Wire.write(0x00);
-  Wire.endTransmission(true);
-
-  // Configure Gyro ±500 dps (FS_SEL = 1)
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x1B);
-  Wire.write(0x08);
   Wire.endTransmission(true);
 
   // Configure Accel ±4g (AFS_SEL = 1)
@@ -131,19 +128,16 @@ void setup() {
   bleGamepad.begin(&config);
 
   sessionStart = millis();
-  lastMicros = micros();
-  delay(500);
+  delay(300);
+  Serial.println("BLE Gamepad Started: Broadcasting as 'Cosmic Wheel'");
 }
 
 unsigned long lastScreen = 0;
+unsigned long lastSerialLog = 0;
 int16_t currentSteerAxis = 0;
 
 void loop() {
   unsigned long now = millis();
-  unsigned long nowMicros = micros();
-  float dt = (nowMicros - lastMicros) / 1000000.0f;
-  lastMicros = nowMicros;
-  if (dt <= 0.0f || dt > 0.05f) dt = 0.01f;
 
   // 1. BOOT Button Logic (Single, Double, Triple Click)
   bool btn = (digitalRead(BOOT_BUTTON_PIN) == LOW);
@@ -172,7 +166,7 @@ void loop() {
       showBanner = true;
       bannerTimer = now;
     } else if (clickCount >= 3) {
-      // 3 Clicks: Invert Direction (Flip Left <-> Right if ever needed)
+      // 3 Clicks: Invert Direction (Flip Left <-> Right)
       invertSteering = !invertSteering;
       prefs.putBool("invert", invertSteering);
       bannerText = invertSteering ? "DIR: REVERSED" : "DIR: NORMAL";
@@ -182,41 +176,32 @@ void loop() {
     clickCount = 0;
   }
 
-  // 2. Read 14 Bytes of Motion Data
+  // 2. Read Accelerometer (6 Bytes: X, Y, Z)
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B); // ACCEL_XOUT_H
   Wire.endTransmission(false);
-  Wire.requestFrom((uint8_t)MPU_ADDR, (size_t)14, true);
+  Wire.requestFrom((uint8_t)MPU_ADDR, (size_t)6, true);
 
-  if (Wire.available() >= 14) {
+  if (Wire.available() >= 6) {
     uint8_t axh = Wire.read(), axl = Wire.read();
     uint8_t ayh = Wire.read(), ayl = Wire.read();
     uint8_t azh = Wire.read(), azl = Wire.read();
-    Wire.read(); Wire.read(); // Skip Temperature
-    uint8_t gxh = Wire.read(), gxl = Wire.read();
-    uint8_t gyh = Wire.read(), gyl = Wire.read();
-    uint8_t gzh = Wire.read(), gzl = Wire.read();
 
     int16_t rawAx = (int16_t)((axh << 8) | axl);
     int16_t rawAy = (int16_t)((ayh << 8) | ayl);
     int16_t rawAz = (int16_t)((azh << 8) | azl);
-    int16_t rawGx = (int16_t)((gxh << 8) | gxl);
-    int16_t rawGz = (int16_t)((gzh << 8) | gzl);
 
     float ax = (float)rawAx / 8192.0f; // ±4g scale
     float ay = (float)rawAy / 8192.0f;
     float az = (float)rawAz / 8192.0f;
-    
-    // Side-to-Side Steering:
-    // With vertical breadboard mount on back, side-to-side tilt moves gravity into AX,
-    // and angular rotation rate is measured by rawGx (in-plane roll).
-    float gyroSteerRate = (float)rawGx / 65.5f;
 
-    // Pitch-invariant Side-Tilt Angle (Right Side Down = Positive, Left Side Down = Negative)
+    // Pitch-invariant Side-Tilt Angle:
+    // When tilting right side down -> positive angle
+    // When tilting left side down -> negative angle
     float accelSideTilt = atan2(ax, sqrt(ay * ay + az * az)) * (180.0f / M_PI);
 
-    // Complementary Filter: 96% gyro rate integration + 4% gravity tilt
-    steerAngleRaw = 0.96f * (steerAngleRaw + gyroSteerRate * dt) + 0.04f * accelSideTilt;
+    // Responsive low-pass filter (instant 10ms response, zero drift, never freezes)
+    steerAngleRaw = (steerAngleRaw * 0.70f) + (accelSideTilt * 0.30f);
   }
 
   // 3. Compute Steering Angle & Inversion
@@ -242,8 +227,6 @@ void loop() {
   }
 
   // Map to 16-bit signed Gamepad X-Axis (-32767 to +32767)
-  // Right tilt down -> Positive X (Turn Right)
-  // Left tilt down -> Negative X (Turn Left)
   currentSteerAxis = (int16_t)constrain(effectiveAngle * 32767.0f, -32767.0f, 32767.0f);
 
   // 5. Send Bluetooth Gamepad Left Stick Report
@@ -257,7 +240,14 @@ void loop() {
   unsigned long minutes = (now - sessionStart) / 60000;
   batteryPct = max(8.0f, 96.0f - (minutes * 0.35f));
 
-  // 7. OLED Telemetry HUD (Updated every 50ms / 20fps)
+  // 7. Serial Debug (every 250ms)
+  if (now - lastSerialLog > 250) {
+    lastSerialLog = now;
+    Serial.printf("Angle: %.1f deg | SteerAxis: %d | BLE: %s\n", 
+                  steerAngle, currentSteerAxis, connected ? "CONNECTED" : "ADVERTISING");
+  }
+
+  // 8. OLED Telemetry HUD (Updated every 50ms / 20fps)
   if (now - lastScreen > 50) {
     lastScreen = now;
     display.clearDisplay();
